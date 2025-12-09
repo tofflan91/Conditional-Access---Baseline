@@ -1,0 +1,17 @@
+{
+    "displayName": "Baseline - Require MFA for all users (exclude break-glass)",
+    "state": "enabled",
+    "conditions": {
+        "users": {
+        "includeUsers": ["All"],
+        "excludeUsers": ["<BREAK_GLASS_USER_OBJECT_ID>"],
+        "excludeGroups": []
+    },
+    "clientAppTypes": ["all"]
+    },
+    "grantControls": {
+        "builtInControls": ["mfa"],
+        "operator": "OR"
+        },
+    "sessionControls": {}
+}

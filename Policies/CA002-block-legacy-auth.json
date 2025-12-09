@@ -1,0 +1,18 @@
+{
+  "displayName": "GLOBAL - 1010 - BLOCK - Legacy Authentication",
+  "state": "enabledForReportingButNotEnforced",
+  "conditions": {
+    "clientAppTypes": [
+      "exchangeActiveSync",
+      "other"
+    ],
+    "users": {
+      "includeUsers": [ "All" ],
+      "excludeUsers": [ "<BREAK_GLASS_USER_OBJECT_ID>" ]
+    }
+  },
+  "grantControls": {
+    "operator": "OR",
+    "builtInControls": [ "block" ]
+  }
+}

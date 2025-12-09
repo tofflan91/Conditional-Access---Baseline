@@ -1,22 +1,27 @@
 <#
 .SYNOPSIS
-  Deploy Conditional Access JSON policies from ./policies into Azure AD via Microsoft Graph.
+  Deploy Conditional Access JSON policies from ./policies into Microsoft Entra ID via Microsoft Graph.
 
 .DESCRIPTION
   - Installs Microsoft.Graph if missing.
   - Connects to Graph with required scopes.
-  - Loads each JSON file from ./policies, prompts for placeholder replacements,
+  - Loads each JSON file from a policies folder, prompts for placeholder replacements,
     validates the JSON and POSTs to /identity/conditionalAccess/policies.
+  - Can also PATCH existing policies with the same displayName when -AllowUpdate is used.
   - Supports -WhatIf mode (no changes, only simulates).
+  - Supports -NonInteractive for unattended runs (no prompts).
 
 .NOTES
-  - You must have permission to create Conditional Access policies.
+  - You must have permission to create/update Conditional Access policies.
   - Template placeholders (e.g. <BREAK_GLASS_USER_OBJECT_ID>) will be discovered and you will be asked to provide values.
-  - Review policies in ./policies before running; adjust 'state' values if you want report-only vs enabled.
+  - Review policies before running; adjust 'state' values if you want enabled vs report-only.
 #>
 
 param(
-    [switch] $WhatIf
+    [switch] $WhatIf,
+    [switch] $NonInteractive,
+    [switch] $AllowUpdate,
+    [string] $PoliciesPath
 )
 
 function Ensure-GraphModule {
@@ -30,20 +35,20 @@ function Ensure-GraphModule {
 
 function Connect-GraphInteractive {
     Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-    # Minimum scopes required to manage CA policies:
+    # Scopes for managing CA policies
     $scopes = @(
         "Policy.ReadWrite.ConditionalAccess",
+        "Policy.Read.All",
         "Directory.Read.All",
-        "Application.ReadWrite.All",
+        "Application.Read.All",
         "User.Read.All"
     )
 
-    # Use interactive login - user will consent.
-    Try {
+    try {
         Connect-MgGraph -Scopes $scopes -ErrorAction Stop
         $ctx = Get-MgContext
         Write-Host "Connected as:" $ctx.Account -ForegroundColor Green
-    } Catch {
+    } catch {
         Write-Error "Failed to connect to Microsoft Graph. $_"
         Exit 1
     }
@@ -51,27 +56,41 @@ function Connect-GraphInteractive {
 
 function PromptForPlaceholderReplacements {
     param(
-        [string] $jsonText
+        [string] $jsonText,
+        [hashtable] $PlaceholderCache,
+        [switch] $NonInteractive
     )
+
+    if ($NonInteractive) {
+        # Do not touch placeholders in non-interactive mode
+        return $jsonText
+    }
 
     # Find placeholders like <SOME_VALUE>
     $placeholders = ([regex]::Matches($jsonText,'\<[^<>]+\>') | ForEach-Object { $_.Value }) | Select-Object -Unique
 
     $replacements = @{}
+
     foreach ($ph in $placeholders) {
-        # skip obvious non-placeholder tokens (in case)
         if ($ph -match '^<\s*>$') { continue }
 
-        # Ask the user for a replacement
+        if ($PlaceholderCache.ContainsKey($ph)) {
+            $replacements[$ph] = $PlaceholderCache[$ph]
+            continue
+        }
+
         $prompt = "Enter value for placeholder $ph (enter to leave as-is)"
         $val = Read-Host $prompt
+
         if ($val -ne "") {
             $replacements[$ph] = $val
+            $PlaceholderCache[$ph] = $val
         }
     }
 
     foreach ($k in $replacements.Keys) {
-        $jsonText = $jsonText -replace [regex]::Escape($k), [System.Text.RegularExpressions.Regex]::Escape($replacements[$k])
+        # Simple literal replacement – no regex semantics
+        $jsonText = $jsonText.Replace($k, $replacements[$k])
     }
 
     return $jsonText
@@ -94,26 +113,70 @@ function Validate-Json {
 function Deploy-Policy {
     param(
         [psobject] $policyObject,
-        [string] $filename,
-        [switch] $WhatIf
+        [string]   $filename,
+        [switch]   $WhatIf,
+        [switch]   $AllowUpdate,
+        [hashtable] $ExistingIndex
     )
 
     $body = ($policyObject | ConvertTo-Json -Depth 99)
+    $displayName = $policyObject.displayName
+    $existingId = $null
+
+    if ($ExistingIndex -and $ExistingIndex.ContainsKey($displayName)) {
+        $existingId = $ExistingIndex[$displayName]
+    }
 
     if ($WhatIf) {
-        Write-Host "[WhatIf] Would create policy from file: $filename" -ForegroundColor Yellow
-        return @{ status = 'WhatIf'; filename = $filename; bodyPreview = ($body.Substring(0,[Math]::Min(400,$body.Length))) }
+        if ($existingId -and $AllowUpdate) {
+            Write-Host "[WhatIf] Would UPDATE existing policy '$displayName' ($existingId) from file: $filename" -ForegroundColor Yellow
+            return @{
+                status      = 'WhatIf-Update'
+                filename    = $filename
+                id          = $existingId
+                displayName = $displayName
+            }
+        }
+        elseif ($existingId) {
+            Write-Host "[WhatIf] Would SKIP (policy exists) '$displayName' ($existingId) from file: $filename" -ForegroundColor Yellow
+            return @{
+                status      = 'WhatIf-ExistsSkipped'
+                filename    = $filename
+                id          = $existingId
+                displayName = $displayName
+            }
+        }
+        else {
+            Write-Host "[WhatIf] Would CREATE policy from file: $filename" -ForegroundColor Yellow
+            return @{
+                status      = 'WhatIf-Create'
+                filename    = $filename
+                displayName = $displayName
+            }
+        }
     }
 
     try {
-        # Use the beta or v1.0 endpoint for conditionalAccess policies
-        # We'll POST to /identity/conditionalAccess/policies
-        $response = Invoke-MgGraphRequest -Method POST -Uri 'identity/conditionalAccess/policies' -Body $body -ContentType 'application/json' -ErrorAction Stop
-        Write-Host "Created policy '$($policyObject.displayName)' (id: $($response.id)) from file $filename" -ForegroundColor Green
-        return @{ status = 'Created'; filename = $filename; id = $response.id; displayName = $policyObject.displayName }
+        if ($existingId -and $AllowUpdate) {
+            Write-Host "Updating existing policy '$displayName' ($existingId) from file $filename..." -ForegroundColor Cyan
+            $uri = "identity/conditionalAccess/policies/$existingId"
+            $null = Invoke-MgGraphRequest -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' -ErrorAction Stop
+            Write-Host "Updated policy '$displayName' ($existingId)." -ForegroundColor Green
+            return @{ status = 'Updated'; filename = $filename; id = $existingId; displayName = $displayName }
+        }
+        elseif ($existingId) {
+            Write-Host "Policy '$displayName' already exists (id: $existingId). Skipping. Use -AllowUpdate to PATCH." -ForegroundColor Yellow
+            return @{ status = 'ExistsSkipped'; filename = $filename; id = $existingId; displayName = $displayName }
+        }
+        else {
+            Write-Host "Creating new policy '$displayName' from file $filename..." -ForegroundColor Cyan
+            $response = Invoke-MgGraphRequest -Method POST -Uri 'identity/conditionalAccess/policies' -Body $body -ContentType 'application/json' -ErrorAction Stop
+            Write-Host "Created policy '$($policyObject.displayName)' (id: $($response.id)) from file $filename" -ForegroundColor Green
+            return @{ status = 'Created'; filename = $filename; id = $response.id; displayName = $policyObject.displayName }
+        }
     } catch {
-        Write-Error "Failed to create policy from $filename : $_"
-        return @{ status = 'Failed'; filename = $filename; error = $_.Exception.Message }
+        Write-Error "Failed to create/update policy from $filename : $_"
+        return @{ status = 'Failed'; filename = $filename; error = $_.Exception.Message; displayName = $displayName }
     }
 }
 
@@ -132,11 +195,16 @@ try {
     Connect-GraphInteractive
 }
 
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$policiesFolder = Join-Path $scriptDir 'policies'
+# Resolve policies folder
+if ([string]::IsNullOrWhiteSpace($PoliciesPath)) {
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $policiesFolder = Join-Path $scriptDir 'policies'
+} else {
+    $policiesFolder = (Resolve-Path $PoliciesPath).Path
+}
 
 if (-not (Test-Path $policiesFolder)) {
-    Write-Error "Policies folder not found: $policiesFolder. Create a 'policies' folder and put your JSON files there."
+    Write-Error "Policies folder not found: $policiesFolder. Create a 'policies' folder and put your JSON files there, or use -PoliciesPath."
     Exit 1
 }
 
@@ -146,60 +214,22 @@ if ($policyFiles.Count -eq 0) {
     Exit 1
 }
 
-$results = @()
-
-foreach ($file in $policyFiles) {
-    Write-Host "----" -ForegroundColor DarkCyan
-    Write-Host "Processing file: $($file.Name)" -ForegroundColor Cyan
-
-    $rawText = Get-Content -Raw -Path $file.FullName
-    # Prompt user for values for placeholders
-    $processedText = PromptForPlaceholderReplacements -jsonText $rawText
-
-    # Validate
-    $policyObj = Validate-Json -text $processedText -filename $file.Name
-    if (-not $policyObj) {
-        Write-Warning "Skipping $($file.Name) due to invalid JSON."
-        $results += @{ status='InvalidJSON'; filename=$file.Name }
-        continue
-    }
-
-    # Offer a summary of the policy before deploying
-    $displayName = $policyObj.displayName
-    $state = $policyObj.state
-    $apps = $null
-    if ($policyObj.conditions -and $policyObj.conditions.applications -and $policyObj.conditions.applications.includeApplications) {
-        $apps = $policyObj.conditions.applications.includeApplications -join ', '
-    } else {
-        $apps = 'All or unspecified'
-    }
-    Write-Host "Policy summary:" -ForegroundColor Magenta
-    Write-Host "  DisplayName: $displayName"
-    Write-Host "  State: $state"
-    Write-Host "  Apps: $apps"
-
-    # Auto-confirm unless WhatIf
-    if ($WhatIf) {
-        $deployResult = Deploy-Policy -policyObject $policyObj -filename $file.Name -WhatIf
-        $results += $deployResult
-    } else {
-        $ok = Read-Host "Create this policy now? (Y/N - default Y)"
-        if ($ok -eq "" -or $ok -match '^[Yy]') {
-            $deployResult = Deploy-Policy -policyObject $policyObj -filename $file.Name
-            $results += $deployResult
-        } else {
-            Write-Host "Skipped creation of $($file.Name)" -ForegroundColor Yellow
-            $results += @{ status='Skipped'; filename=$file.Name }
+# Get existing policies once and index by displayName
+$existingIndex = @{}
+try {
+    Write-Host "Fetching existing Conditional Access policies..." -ForegroundColor Cyan
+    $existing = Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop
+    foreach ($p in $existing) {
+        if (-not [string]::IsNullOrWhiteSpace($p.displayName)) {
+            $existingIndex[$p.displayName] = $p.Id
         }
     }
+    Write-Host "Found $($existingIndex.Count) existing policies." -ForegroundColor Green
+} catch {
+    Write-Warning "Could not fetch existing policies. Create operations will still work, but -AllowUpdate will be ineffective. $_"
 }
 
-# Summary
-Write-Host "----" -ForegroundColor DarkGreen
-Write-Host "Deployment summary:" -ForegroundColor Green
-$results | Format-Table -AutoSize
+$results = @()
+$placeholderCache = @{}
 
-Write-Host "`nNotes:" -ForegroundColor Cyan
-Write-Host "- Check Azure AD > Security > Conditional Access to review the newly created policies."
-Write-Host "- Use report-only mode for high-impact policies until tuned."
-Write-Host "- If you need automated mapping for role name -> role id or group name -> objectId, we can extend this script to resolve those via Graph."
+foreach ($file
